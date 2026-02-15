@@ -1,0 +1,29 @@
+{
+    "name": "global-tunnel",
+    "version": "1.0.0",
+    "description": "Expose local servers to the world with a public URL",
+    "type": "module",
+    "scripts": {
+      "server": "node server/index.js",
+      "client": "node client/index.js",
+      "start": "node server/index.js"
+    },
+    "keywords": [
+      "tunnel",
+      "global-tunnel",
+      "localhost",
+      "proxy"
+    ],
+    "license": "MIT",
+    "dependencies": {
+      "dotenv": "^17.3.1",
+      "ws": "^8.18.0"
+    },
+    "bin": {
+      "global-tunnel": "./client/index.js"
+    },
+    "engines": {
+      "node": ">=18"
+    }
+  }
+  
