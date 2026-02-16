@@ -2,6 +2,8 @@
 
 Expose your local server to the internet with a public URL.
 
+**Client:** [global-tunnel-client](https://github.com/brahmatzadeh/global-tunnel-client)
+
 ## How to install the server
 
 On the machine that will host the tunnel (e.g. a VPS), run:
@@ -29,7 +31,7 @@ When setup is done, start the server:
 npm run server
 ```
 
-From any machine, run the client:
+From any machine, run the [client](https://github.com/brahmatzadeh/global-tunnel-client):
 
 ```bash
 npx global-tunnel --port 3000 --server wss://tunnel.example.com
