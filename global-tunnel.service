@@ -5,15 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# WorkingDirectory and User are set by install.sh when installing to systemd
-WorkingDirectory=REPLACE_PROJECT_ROOT
-User=REPLACE_USER
-ExecStart=REPLACE_NODE_BIN server/index.js
-Restart=always
+User=root
+Group=root
+WorkingDirectory=/opt/global-tunnel
+ExecStart=/opt/global-tunnel/global-tunnel-server
+Restart=on-failure
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=global-tunnel
 
 [Install]
 WantedBy=multi-user.target

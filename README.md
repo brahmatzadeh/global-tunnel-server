@@ -2,8 +2,6 @@
 
 Expose your local server to the internet with a public URL.
 
-**Client:** [global-tunnel-client](https://github.com/brahmatzadeh/global-tunnel-client)
-
 ## How to install the server
 
 On the machine that will host the tunnel (e.g. a VPS), run:
@@ -23,21 +21,17 @@ The script will ask for:
 
 It then installs certbot and nginx if needed, guides you through DNS (wildcard A record) and a Let's Encrypt wildcard cert, configures nginx, and writes `.env`.
 
-**Requirements:** Node.js 18+, sudo (Debian/Ubuntu).
+**Requirements:** Go 1.21+, sudo (Debian/Ubuntu).
 
 When setup is done, start the server:
 
 ```bash
-npm run server
+go run ./server
+# or build and run:
+go build -o global-tunnel-server ./server && ./global-tunnel-server
 ```
 
-From any machine, run the [client](https://github.com/brahmatzadeh/global-tunnel-client):
-
-```bash
-npx global-tunnel --port 3000 --server wss://tunnel.example.com
-```
-
-(Use the domain you entered during install.)
+Use any tunnel client that connects to `wss://<your-domain>/_tunnel` and sends a `register` message (optional `subdomain`, `tcpPort`). The server responds with `registered` (subdomain, url, etc.).
 
 ## Preferred subdomain
 
@@ -51,11 +45,7 @@ Clients can request a specific subdomain when registering. If that subdomain is 
   - `requestedSubdomain` — what you asked for (if any)
   - `usedRequestedSubdomain` — `true` if you got your requested subdomain, `false` if it was taken or invalid
 
-Example with CLI (if your client supports it):
-
-```bash
-npx global-tunnel --port 3000 --server wss://tunnel.example.com --subdomain myapp
-```
+Clients send e.g. `{ "type": "register", "subdomain": "myapp" }` to request that subdomain.
 
 ## TCP tunnel
 

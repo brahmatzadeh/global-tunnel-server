@@ -1,0 +1,4 @@
+global-tunnel-server
+.env
+*.log
+.DS_Store

@@ -6,19 +6,19 @@
 #
 # Usage: ./install.sh   (from repo root, or any dir — script finds repo root)
 #    or: bash install.sh
-# Requires: sudo (apt/nginx/certbot), Node.js 18+
+# Requires: sudo (apt/nginx/certbot), Go 1.21+
 #
 
 set -e
 
 # Find project root (directory containing package.json and server/)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [[ -f "$SCRIPT_DIR/package.json" ]] && [[ -d "$SCRIPT_DIR/server" ]]; then
+if [[ -f "$SCRIPT_DIR/go.mod" ]] && [[ -d "$SCRIPT_DIR/server" ]]; then
   PROJECT_ROOT="$SCRIPT_DIR"
 else
   PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-  if [[ ! -f "$PROJECT_ROOT/package.json" ]] || [[ ! -d "$PROJECT_ROOT/server" ]]; then
-    echo "Run install.sh from the global-tunnel repo root (where package.json and server/ are)."
+  if [[ ! -f "$PROJECT_ROOT/go.mod" ]] || [[ ! -d "$PROJECT_ROOT/server" ]]; then
+    echo "Run install.sh from the global-tunnel repo root (where go.mod and server/ are)."
     exit 1
   fi
 fi
@@ -56,7 +56,7 @@ while true; do
 done
 
 log_step "2. Server ports and protocol"
-log "The app runs behind nginx: nginx listens on 443, the Node app on a local port."
+log "The app runs behind nginx: nginx listens on 443, the Go app on a local port."
 PORT=$(prompt_default "Backend port (app listen)" "4040")
 PUBLIC_PORT=$(prompt_default "Public HTTPS port (nginx)" "443")
 PUBLIC_PROTOCOL=$(prompt_default "Public protocol (http or https)" "https")
@@ -65,8 +65,8 @@ log ""
 
 # --- Dependencies ---
 log_step "3. Dependencies"
-if ! command -v node >/dev/null 2>&1; then
-  log "Node.js 18+ is required. Install it and run this script again."
+if ! command -v go >/dev/null 2>&1; then
+  log "Go 1.21+ is required. Install it and run this script again."
   exit 1
 fi
 for cmd in certbot nginx; do
@@ -162,44 +162,54 @@ ENVEOF
 log "Wrote $ENV_FILE"
 log ""
 
-# --- npm ---
-log_step "8. npm install"
-if [[ -f "$PROJECT_ROOT/package.json" ]]; then
-  (cd "$PROJECT_ROOT" && npm install --silent)
-  log "Done."
+# --- Go build ---
+log_step "8. Go build"
+if [[ -f "$PROJECT_ROOT/go.mod" ]]; then
+  (cd "$PROJECT_ROOT" && go build -o global-tunnel-server ./server)
+  log "Done. Binary: $PROJECT_ROOT/global-tunnel-server"
 else
-  log "No package.json in $PROJECT_ROOT"
+  log "No go.mod in $PROJECT_ROOT"
 fi
 log ""
 
-# --- Systemd service (run on boot, restart on failure) ---
-log_step "9. Systemd service"
-RUN_AS_USER="${SUDO_USER:-$USER}"
-NODE_BIN="$(command -v node)"
-if [[ -z "$NODE_BIN" ]]; then
-  log "Could not find node in PATH. Skipping service install."
-else
-  SVC_DEST="/etc/systemd/system/global-tunnel.service"
-  sed "s|REPLACE_PROJECT_ROOT|$PROJECT_ROOT|g;s|REPLACE_USER|$RUN_AS_USER|g;s|REPLACE_NODE_BIN|$NODE_BIN|g" \
-    "$PROJECT_ROOT/global-tunnel.service" | sudo tee "$SVC_DEST" >/dev/null
-  sudo systemctl daemon-reload
-  sudo systemctl enable global-tunnel
-  sudo systemctl start global-tunnel
-  log "Service installed and started. It will start automatically on boot."
+# --- systemd service (run on boot) ---
+log_step "9. systemd service"
+SERVICE_USER="${SUDO_USER:-$USER}"
+if [[ -z "$SERVICE_USER" ]] || [[ "$SERVICE_USER" == "root" ]]; then
+  SERVICE_USER="root"
 fi
+UNIT_FILE="/etc/systemd/system/global-tunnel.service"
+sudo tee "$UNIT_FILE" >/dev/null << UNITEOF
+[Unit]
+Description=Global Tunnel server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$PROJECT_ROOT
+ExecStart=$PROJECT_ROOT/global-tunnel-server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable global-tunnel.service
+sudo systemctl start global-tunnel.service
+log "Service installed and started. It will run on boot."
+log "  status: sudo systemctl status global-tunnel"
+log "  stop:   sudo systemctl stop global-tunnel"
+log "  start:  sudo systemctl start global-tunnel"
 log ""
 
 # --- Done ---
 log_step "Setup complete"
-log "The tunnel server is running as a systemd service (starts on boot, restarts on failure)."
-log "Manage it with:"
-log "  sudo systemctl status global-tunnel   # check status"
-log "  sudo systemctl restart global-tunnel  # restart"
-log "  sudo systemctl stop global-tunnel     # stop"
-log ""
 WS_PROTOCOL="wss"
 [[ "$PUBLIC_PROTOCOL" != "https" ]] && WS_PROTOCOL="ws"
-log "From any machine, run the client:"
-log "  npx global-tunnel --port 3000 --server $WS_PROTOCOL://$TUNNEL_DOMAIN"
-log "  npx global-tunnel --port 3000 --server $WS_PROTOCOL://$TUNNEL_DOMAIN --subdomain myapp"
+log "Use a tunnel client that connects to $WS_PROTOCOL://$TUNNEL_DOMAIN/_tunnel"
 log ""
