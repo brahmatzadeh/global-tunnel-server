@@ -4,17 +4,21 @@
  * Tunnel Server
  * Accepts WebSocket connections from tunnel clients and forwards HTTP traffic
  * from the public internet to the appropriate client based on subdomain.
+ * Optional TCP tunnel: public clients connect to TCP_TUNNEL_PORT, send "subdomain\n", then raw TCP is proxied to the client's local port.
  */
 
 import "dotenv/config";
 import http from "http";
 import https from "https";
 import fs from "fs";
+import net from "net";
 import { WebSocketServer } from "ws";
 import { randomBytes } from "crypto";
 
 const PORT = parseInt(process.env.PORT || "443", 10);
 const TUNNEL_DOMAIN = process.env.TUNNEL_DOMAIN || "localhost";
+// TCP tunnel: set TCP_TUNNEL_PORT (e.g. 4000) to enable. Public clients connect, send "subdomain\n", then raw TCP is forwarded.
+const TCP_TUNNEL_PORT = parseInt(process.env.TCP_TUNNEL_PORT || "0", 10);
 
 // When behind a reverse proxy (e.g. nginx on 443): app listens on PORT but public URL is on PUBLIC_PORT.
 const PUBLIC_PORT = process.env.PUBLIC_PORT != null ? parseInt(process.env.PUBLIC_PORT, 10) : PORT;
@@ -46,14 +50,18 @@ const portSuffix =
   PUBLIC_PORT === 80 || PUBLIC_PORT === 443 ? "" : ":" + PUBLIC_PORT;
 const advertisedProtocol = PUBLIC_PROTOCOL;
 
-// subdomain -> { ws, createdAt }
+// subdomain -> { ws, createdAt, tcpPort? }
 const tunnels = new Map();
 // requestId -> { resolve, reject, timeout }
 const pendingRequests = new Map();
 // proxied WebSocket id -> { browserWs, tunnelWs }
 const pendingProxiedWs = new Map();
+// tcp connection id -> { publicSocket, tunnelWs, buffer }
+const pendingTcpConnections = new Map();
 
 const REQUEST_TIMEOUT_MS = 60_000;
+const TCP_CONNECT_TIMEOUT_MS = 15_000;
+const TCP_HANDSHAKE_TIMEOUT_MS = 5_000;
 
 function generateSubdomain() {
   return randomBytes(4).toString("hex");
@@ -91,6 +99,97 @@ function parseRequestBody(req) {
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", () => resolve(Buffer.alloc(0)));
+  });
+}
+
+function createTcpTunnelServer() {
+  const tcpServer = net.createServer((publicSocket) => {
+    let handshakeDone = false;
+    let buf = Buffer.alloc(0);
+    const handshakeTimeout = setTimeout(() => {
+      if (!handshakeDone) {
+        handshakeDone = true;
+        publicSocket.destroy();
+      }
+    }, TCP_HANDSHAKE_TIMEOUT_MS);
+
+    function consumeHandshake() {
+      const idx = buf.indexOf(0x0a); // '\n'
+      if (idx === -1) return false;
+      handshakeDone = true;
+      clearTimeout(handshakeTimeout);
+      const line = buf.subarray(0, idx).toString("utf8").trim();
+      const rest = buf.subarray(idx + 1);
+      buf = Buffer.alloc(0);
+      const subdomain = normalizeSubdomain(line);
+      if (!subdomain || !isValidSubdomain(subdomain)) {
+        publicSocket.destroy();
+        return;
+      }
+      const tunnel = tunnels.get(subdomain);
+      if (!tunnel || tunnel.ws.readyState !== 1 || tunnel.tcpPort == null) {
+        publicSocket.destroy();
+        return;
+      }
+      const id = randomBytes(8).toString("hex");
+      const entry = {
+        publicSocket,
+        tunnelWs: tunnel.ws,
+        buffer: rest.length > 0 ? [rest] : [],
+        connectTimeout: setTimeout(() => {
+          if (pendingTcpConnections.has(id)) {
+            pendingTcpConnections.delete(id);
+            publicSocket.destroy();
+          }
+        }, TCP_CONNECT_TIMEOUT_MS),
+      };
+      pendingTcpConnections.set(id, entry);
+      try {
+        tunnel.ws.send(JSON.stringify({ type: "tcp-connect", id, port: tunnel.tcpPort }));
+      } catch (err) {
+        pendingTcpConnections.delete(id);
+        clearTimeout(entry.connectTimeout);
+        publicSocket.destroy();
+        return;
+      }
+      publicSocket.removeAllListeners("data");
+      publicSocket.on("data", (chunk) => {
+        if (entry.connectTimeout != null) {
+          entry.buffer.push(chunk);
+        }
+      });
+      publicSocket.on("close", () => {
+        if (pendingTcpConnections.has(id)) {
+          pendingTcpConnections.delete(id);
+          if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+          if (tunnel.ws.readyState === 1) {
+            tunnel.ws.send(JSON.stringify({ type: "tcp-close", id }));
+          }
+        }
+      });
+      publicSocket.on("error", () => {
+        if (pendingTcpConnections.has(id)) {
+          pendingTcpConnections.delete(id);
+          if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+          if (tunnel.ws.readyState === 1) {
+            tunnel.ws.send(JSON.stringify({ type: "tcp-close", id }));
+          }
+        }
+      });
+    }
+
+    publicSocket.on("data", (chunk) => {
+      if (handshakeDone) return;
+      buf = Buffer.concat([buf, chunk]);
+      consumeHandshake();
+    });
+  });
+
+  tcpServer.listen(TCP_TUNNEL_PORT, () => {
+    console.log(`TCP tunnel listening on port ${TCP_TUNNEL_PORT} (connect, send "subdomain\\n", then raw TCP)`);
+  });
+  tcpServer.on("error", (err) => {
+    console.error("TCP tunnel server error:", err.message);
   });
 }
 
@@ -283,16 +382,20 @@ wss.on("connection", (ws, req) => {
         const validRequest = requested && isValidSubdomain(requested);
         const available = validRequest && !tunnels.has(requested);
         subdomain = available ? requested : generateSubdomain();
-        tunnels.set(subdomain, { ws, createdAt: Date.now() });
-        ws.send(
-          JSON.stringify({
-            type: "registered",
-            subdomain,
-            url: `${advertisedProtocol}://${subdomain}.${TUNNEL_DOMAIN}${portSuffix}`,
-            requestedSubdomain: requested || undefined,
-            usedRequestedSubdomain: available,
-          })
-        );
+        const tcpPort = typeof msg.tcpPort === "number" && msg.tcpPort > 0 && msg.tcpPort <= 65535 ? msg.tcpPort : null;
+        tunnels.set(subdomain, { ws, createdAt: Date.now(), tcpPort });
+        const payload = {
+          type: "registered",
+          subdomain,
+          url: `${advertisedProtocol}://${subdomain}.${TUNNEL_DOMAIN}${portSuffix}`,
+          requestedSubdomain: requested || undefined,
+          usedRequestedSubdomain: available,
+        };
+        if (TCP_TUNNEL_PORT > 0) {
+          payload.tcpTunnelPort = TCP_TUNNEL_PORT;
+          if (tcpPort != null) payload.tcpPort = tcpPort;
+        }
+        ws.send(JSON.stringify(payload));
         return;
       }
       if (msg.type === "response" && msg.id && pendingRequests.has(msg.id)) {
@@ -316,6 +419,47 @@ wss.on("connection", (ws, req) => {
         if (browserWs.readyState === 1) browserWs.close();
         return;
       }
+      // TCP tunnel: client confirms local connection ready
+      if (msg.type === "tcp-connected" && msg.id && pendingTcpConnections.has(msg.id)) {
+        const entry = pendingTcpConnections.get(msg.id);
+        if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+        entry.connectTimeout = null;
+        entry.publicSocket.removeAllListeners("data");
+        const id = msg.id;
+        // Flush buffered data from public client (received before handshake completed)
+        for (const chunk of entry.buffer) {
+          if (entry.tunnelWs.readyState === 1) {
+            entry.tunnelWs.send(JSON.stringify({ type: "tcp-data", id, payload: chunk.toString("base64") }));
+          }
+        }
+        entry.buffer = [];
+        entry.publicSocket.on("data", (chunk) => {
+          if (entry.tunnelWs.readyState === 1) {
+            entry.tunnelWs.send(JSON.stringify({ type: "tcp-data", id, payload: chunk.toString("base64") }));
+          }
+        });
+        return;
+      }
+      if (msg.type === "tcp-error" && msg.id && pendingTcpConnections.has(msg.id)) {
+        const entry = pendingTcpConnections.get(msg.id);
+        pendingTcpConnections.delete(msg.id);
+        if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+        entry.publicSocket.destroy();
+        return;
+      }
+      if (msg.type === "tcp-data" && msg.id && pendingTcpConnections.has(msg.id)) {
+        const entry = pendingTcpConnections.get(msg.id);
+        if (entry.publicSocket.writable) {
+          entry.publicSocket.write(Buffer.from(msg.payload, "base64"));
+        }
+        return;
+      }
+      if (msg.type === "tcp-close" && msg.id && pendingTcpConnections.has(msg.id)) {
+        const entry = pendingTcpConnections.get(msg.id);
+        pendingTcpConnections.delete(msg.id);
+        entry.publicSocket.destroy();
+        return;
+      }
     } catch (e) {
       console.error("Message error:", e.message);
     }
@@ -329,13 +473,24 @@ wss.on("connection", (ws, req) => {
       }
     }
   }
+  function closeTcpForTunnel() {
+    for (const [id, entry] of pendingTcpConnections) {
+      if (entry.tunnelWs === ws) {
+        if (entry.connectTimeout) clearTimeout(entry.connectTimeout);
+        entry.publicSocket.destroy();
+        pendingTcpConnections.delete(id);
+      }
+    }
+  }
   ws.on("close", () => {
     closeProxiedForTunnel();
+    closeTcpForTunnel();
     if (subdomain) tunnels.delete(subdomain);
   });
 
   ws.on("error", () => {
     closeProxiedForTunnel();
+    closeTcpForTunnel();
     if (subdomain) tunnels.delete(subdomain);
   });
 });
@@ -347,4 +502,7 @@ server.listen(PORT, () => {
   console.log(
     `Public base: ${advertisedProtocol}://<subdomain>.${TUNNEL_DOMAIN}${portSuffix}`
   );
+  if (TCP_TUNNEL_PORT > 0) {
+    createTcpTunnelServer();
+  }
 });
