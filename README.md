@@ -2,6 +2,8 @@
 
 Expose your local server to the internet with a public URL.
 
+**Client:** [global-tunnel-client](https://github.com/brahmatzadeh/global-tunnel-client) — standalone client that exposes a local port through a public URL via this server.
+
 ## How to install the server
 
 On the machine that will host the tunnel (e.g. a VPS), run:
