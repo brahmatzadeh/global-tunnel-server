@@ -59,6 +59,19 @@ function generateSubdomain() {
   return randomBytes(4).toString("hex");
 }
 
+// Subdomain must be a valid DNS label: 1–63 chars, lowercase alphanumeric and hyphen, no leading/trailing hyphen
+const SUBDOMAIN_MAX_LEN = 63;
+const SUBDOMAIN_REGEX = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
+function isValidSubdomain(s) {
+  if (typeof s !== "string" || s.length === 0 || s.length > SUBDOMAIN_MAX_LEN) return false;
+  return SUBDOMAIN_REGEX.test(s);
+}
+
+function normalizeSubdomain(s) {
+  return String(s).toLowerCase().trim();
+}
+
 function extractSubdomain(host) {
   if (!host) return null;
   const hostname = host.split(":")[0];
@@ -266,16 +279,18 @@ wss.on("connection", (ws, req) => {
     try {
       const msg = JSON.parse(data.toString());
       if (msg.type === "register") {
-        subdomain =
-          msg.subdomain && !tunnels.has(msg.subdomain)
-            ? msg.subdomain
-            : generateSubdomain();
+        const requested = msg.subdomain != null ? normalizeSubdomain(msg.subdomain) : null;
+        const validRequest = requested && isValidSubdomain(requested);
+        const available = validRequest && !tunnels.has(requested);
+        subdomain = available ? requested : generateSubdomain();
         tunnels.set(subdomain, { ws, createdAt: Date.now() });
         ws.send(
           JSON.stringify({
             type: "registered",
             subdomain,
             url: `${advertisedProtocol}://${subdomain}.${TUNNEL_DOMAIN}${portSuffix}`,
+            requestedSubdomain: requested || undefined,
+            usedRequestedSubdomain: available,
           })
         );
         return;
